@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"io/ioutil"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/karrick/godirwalk"
 	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/internal/vhd"
 	"github.com/pterodactyl/wings/system"
 	ignore "github.com/sabhiram/go-gitignore"
 )
@@ -29,6 +31,7 @@ type Filesystem struct {
 	diskUsed          int64
 	diskCheckInterval time.Duration
 	denylist          *ignore.GitIgnore
+	vhd               *vhd.Disk
 
 	// The maximum amount of disk space (in bytes) that this Filesystem instance can use.
 	diskLimit int64
@@ -40,8 +43,9 @@ type Filesystem struct {
 }
 
 // New creates a new Filesystem instance for a given server.
-func New(root string, size int64, denylist []string) *Filesystem {
-	return &Filesystem{
+func New(uuid string, size int64, denylist []string) *Filesystem {
+	root := filepath.Join(config.Get().System.Data, uuid)
+	fs := Filesystem{
 		root:              root,
 		diskLimit:         size,
 		diskCheckInterval: time.Duration(config.Get().System.DiskCheckInterval),
@@ -49,11 +53,40 @@ func New(root string, size int64, denylist []string) *Filesystem {
 		lookupInProgress:  system.NewAtomicBool(false),
 		denylist:          ignore.CompileIgnoreLines(denylist...),
 	}
+
+	if config.Get().System.UseVirtualDisks {
+		fs.vhd = vhd.New(size, VirtualDiskPath(uuid), fs.root)
+	}
+
+	return &fs
+}
+
+func VirtualDiskPath(uuid string) string {
+	return filepath.Join(config.Get().System.Data, ".vhd/", uuid+".img")
 }
 
 // Path returns the root path for the Filesystem instance.
 func (fs *Filesystem) Path() string {
 	return fs.root
+}
+
+// IsVirtual returns true if the filesystem is currently using a virtual disk.
+func (fs *Filesystem) IsVirtual() bool {
+	return fs.vhd != nil
+}
+
+// MountDisk will attempt to mount the underlying virtual disk for the server.
+// If the disk is already mounted this is a no-op function. If the filesystem is
+// not configured for virtual disks this function will panic.
+func (fs *Filesystem) MountDisk(ctx context.Context) error {
+	if !fs.IsVirtual() {
+		panic(errors.New("filesystem: cannot call MountDisk on Filesystem instance without VHD present"))
+	}
+	err := fs.vhd.Mount(ctx)
+	if errors.Is(err, vhd.ErrFilesystemMounted) {
+		return nil
+	}
+	return errors.WrapIf(err, "filesystem: failed to mount VHD")
 }
 
 // File returns a reader for a file instance as well as the stat information.
@@ -167,6 +200,12 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 
 	buf := make([]byte, 1024*4)
 	sz, err := io.CopyBuffer(file, r, buf)
+	if err != nil {
+		if strings.Contains(err.Error(), "no space left on device") {
+			return newFilesystemError(ErrCodeDiskSpace, err)
+		}
+		return errors.WrapIf(err, "filesystem: failed to copy buffer for file write")
+	}
 
 	// Adjust the disk usage to account for the old size and the new size of the file.
 	fs.addDisk(sz - currentSize)
@@ -321,8 +360,9 @@ func (fs *Filesystem) findCopySuffix(dir string, name string, extension string) 
 	return name + suffix + extension, nil
 }
 
-// Copies a given file to the same location and appends a suffix to the file to indicate that
-// it has been copied.
+// Copy takes a given input file path and creates a copy of the file at the same
+// location, appending a unique number to the end. For example, a copy of "test.txt"
+// would create "test 2.txt" as the copy, then "test 3.txt" and so on.
 func (fs *Filesystem) Copy(p string) error {
 	cleaned, err := fs.SafePath(p)
 	if err != nil {
